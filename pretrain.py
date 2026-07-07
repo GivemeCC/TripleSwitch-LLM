@@ -68,9 +68,20 @@ def train_epoch(epoch):
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
-        scaler.scale(loss).backward()
+        # 判断：是不是最后一次累积步骤
+        is_last_step = ((step + 1) % args.accumulation_steps == 0)
 
-        if (step + 1) % args.accumulation_steps == 0:
+        # 不是最后一次 → 关掉同步
+        if not is_last_step:
+            with model.no_sync():          # 关键：跳过 all-reduce
+        scaler.scale(loss).backward()
+        else:
+        # 最后一次 → 正常 backward（会触发同步）
+            scaler.scale(loss).backward()
+
+
+        # 判断累积满了再更新参数
+        if is_last_step:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
