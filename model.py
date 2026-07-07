@@ -519,81 +519,86 @@ class MoEGate(nn.Module):
 
 
 class MOEFeedForward(nn.Module):
-    """
-    MoE 前馈网络。
-    - 训练：循环路由，逐个专家计算
-    - 推理：批处理，按专家分组计算
-    """
-    def __init__(self, config: TripleConfig):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.n_routed_experts = config.n_routed_experts
-        self.top_k = config.num_experts_per_tok
-        self.n_shared_experts = config.n_shared_experts
-
-        # 路由门控
-        self.gate = MoEGate(config)
-
-        # 路由专家
+        self.config = config
         self.experts = nn.ModuleList([
-            FeedForward(config) for _ in range(self.n_routed_experts)
+            FeedForward(config)
+            for _ in range(config.n_routed_experts)
         ])
-
-        # 共享专家
-        if self.n_shared_experts > 0:
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
             self.shared_experts = nn.ModuleList([
-                FeedForward(config) for _ in range(self.n_shared_experts)
+                FeedForward(config)
+                for _ in range(config.n_shared_experts)
             ])
 
-        self.aux_loss = torch.tensor(0.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = x.shape
-
-        # 共享专家路径
-        shared_out = 0
-        if self.n_shared_experts > 0:
-            for expert in self.shared_experts:
-                shared_out = shared_out + expert(x)
-
-        # 门控路由
+    def forward(self, x):
+        identity = x  # 做 skip connection
+        orig_shape = x.shape
+        bsz, seq_len, _ = x.shape
+        # 使用门控机制专家的选择
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        self.aux_loss = aux_loss
-
-        # 路由专家路径
-        flat_topk_idx = topk_idx.view(-1)  # [total_tokens * top_k]
-        total_tokens = batch * seq_len
-        x_flat = x.view(total_tokens, -1)  # [total_tokens, hidden]
+        x = x.view(-1, x.shape[-1])
+        flat_topk_idx = topk_idx.view(-1)
 
         if self.training:
-            # 训练：循环遍历专家
-            y = torch.zeros(total_tokens, hidden_size, device=x.device, dtype=x.dtype)
+            # 对每个token，复制 num_experts_per_tok 多份，
+            # 这样做的目的是为了将每个token同时传入其top-K个被选中的专家里面进行计算
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # 创建一个与x形状相同但是类型为 float16 的空张量，用于存储每个token经过对应专家处理后的结果
+            y = torch.empty_like(x, dtype=torch.float16)
             for i, expert in enumerate(self.experts):
-                mask = flat_topk_idx == i
-                if mask.any():
-                    y[mask] = expert(x_flat[mask])
-            y = y.view(batch, seq_len, -1)
-            # 加权求和
-            topk_weight = topk_weight.view(batch, seq_len, self.top_k, 1)
-            y = y.view(batch, seq_len, -1, hidden_size).gather(
-                2, topk_idx.view(batch, seq_len, self.top_k, 1).expand(-1, -1, -1, hidden_size)
-            )
-            y = (y * topk_weight).sum(dim=2)
+                # flat_topk_idx 是一个索引张量，表示每个token被分配给了哪个专家
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)
+            # 将输出按照token和专家维度重新组织
+            # 使用 topk_weight 权重对每个专家的输出进行加权求和
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            # 把最终输出恢复成原始输入的形状
+            y = y.view(*orig_shape)
         else:
-            # 推理：按专家批处理
-            y = torch.zeros(total_tokens, hidden_size, device=x.device, dtype=x.dtype)
-            idxs = flat_topk_idx.argsort()
-            tokens_per_expert = torch.bincount(flat_topk_idx, minlength=self.n_routed_experts)
-            start = 0
-            for i, count in enumerate(tokens_per_expert):
-                if count > 0:
-                    expert = self.experts[i]
-                    expert_tokens = x_flat[idxs[start:start + count]]
-                    y.index_add_(0, idxs[start:start + count], expert(expert_tokens))
-                start += count
-            y = y.view(batch, seq_len, -1)
+            # 在推理阶段使用更高效的函数 moe_infer 处理 MOE 部分
+            # 通常是为了减少内存冗余或计算冗余，例如合并多个token，一起处理
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+        
+        # 如果启用了共享专家，它们会作用在所有的token上
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
 
-        return y + shared_out
+        # 通常这个损失会加到 total_loss = task_loss + config.aux_loss_coeff * model.aux_loss
+        self.aux_loss = aux_loss
+
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_expert_indices.argsort()
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # tokens_per_expert = [6, 15, 20, 26] 这四个数值分别代表4个专家处理的token数量
+        tokens_idxs = idxs // self.config.num_experts_per_tok
+        # token_idxs = [3, 7, 19, 21, 24, 25, 4, 5, 6, 10, 11, 12...] 代表着 token_idxs[:6]
+        # 属于0号专家的；每个token有可能被多个专家处理，取决于 config.num_experts_per_tok
+
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前专家处理token的起始索引
+            start_idx = 0 if i==0 else tokens_per_expert[i-1]
+            # 如果没有token被分配给这个专家，跳过该专家
+            if start_idx == end_idx:
+                continue
+            expert = self.experts[i]
+            exp_token_idx = tokens_idxs[start_idx:end_idx]
+            # 从原始的输入x中获取这些token的嵌入
+            expert_tokens = x[exp_token_idx]
+            # 输入到当前专家网络中进行前向传播；
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 对专家输出进行加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 使用 scatter_add_ 将专家输出加到最终的输出张量上面去，加权之后的求和
+            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+
+        return expert_cache
 
 
 # ============================================================
